@@ -29,14 +29,202 @@ USER_AGENT = "repopulse-sentinel/1.0 (+https://github.com/yaminbinyoosuf/repopul
 
 
 # --------------------------------------------------------------------------
-# shared helpers
+# payload bounding
+#
+# Whatever a tool returns is copied into the observed event and stored in
+# live_sessions. Storing whole API bodies is what produced a 14.8 MB session
+# and a 57014 statement timeout on publish, so every body is bounded here.
+#
+# Three stages, tightest last:
+#   1. _truncate_dict -- caps every individual string field
+#   2. _slim_*        -- a per-tool projection keeping only what the agent
+#                        actually reads (repo names, the latest version,
+#                        advisory ids), dropping bulk such as PyPI's `releases`
+#                        map or npm's `versions` map. Truncating strings alone
+#                        is not enough: those bodies are large because of their
+#                        *shape*, not because of any one long string.
+#   3. _fit           -- hard ceiling, a last resort that logs loudly
 # --------------------------------------------------------------------------
-def _safe_json(response: httpx.Response) -> Any:
+MAX_BODY_CHARS = 2000
+MAX_BODY_BYTES = 20_000
+MAX_ITEMS = 25
+MAX_VULNS = 50
+VULN_SUMMARY_MAX = 15
+
+
+def _truncate(text: str, n: int = MAX_BODY_CHARS) -> str:
+    if not text:
+        return text
+    if len(text) <= n:
+        return text
+    return text[:n] + f"... [truncated, {len(text) - n} more chars]"
+
+
+def _truncate_dict(obj, limit: int = MAX_BODY_CHARS):
+    if isinstance(obj, str):
+        return _truncate(obj, limit)
+    if isinstance(obj, dict):
+        return {k: _truncate_dict(v, limit) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_truncate_dict(v, limit) for v in obj]
+    return obj
+
+
+def _safe_json(r):
     try:
-        return response.json()
+        data = r.json()
     except Exception:
         # Not JSON (gateway HTML, empty body, truncated response...)
-        return {"_raw_text": response.text[:500]}
+        return {"_raw_text": _truncate(r.text)}
+    return _truncate_dict(data)
+
+
+def _json_size(obj) -> int:
+    try:
+        return len(json.dumps(obj))
+    except Exception:
+        return 0
+
+
+def _fit(body, limit: int = MAX_BODY_BYTES):
+    """Hard ceiling. Only reachable if a projection failed to shrink a body."""
+    size = _json_size(body)
+    if size <= limit:
+        return body
+    log.error("body still %d bytes after projection; hard-truncating to %d", size, limit)
+    return {
+        "_truncated": True,
+        "_original_bytes": size,
+        "preview": _truncate(json.dumps(body), 1000),
+    }
+
+
+# --- per-tool projections -------------------------------------------------
+def _slim_github_search(body):
+    """Keep only the fields the agent reads: full_name drives the whole walk."""
+    if not isinstance(body, dict):
+        return body
+    items = body.get("items")
+    if not isinstance(items, list):
+        return body
+    slim = []
+    for item in items[:MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        slim.append({
+            "full_name": item.get("full_name"),
+            "language": item.get("language"),
+            "stargazers_count": item.get("stargazers_count"),
+            "pushed_at": item.get("pushed_at"),
+            "default_branch": item.get("default_branch"),
+        })
+    return {
+        "total_count": body.get("total_count"),
+        "incomplete_results": body.get("incomplete_results"),
+        "items": slim,
+    }
+
+
+def _slim_github_file(body):
+    if not isinstance(body, dict):
+        return body
+    out = {
+        k: body.get(k)
+        for k in (
+            "name",
+            "path",
+            "sha",
+            "size",
+            "encoding",
+            "content_encoding",
+            "content_truncated",
+            "content_original_chars",
+        )
+        if k in body
+    }
+    out["content"] = body.get("content")
+    return out
+
+
+def _slim_pypi(body):
+    """Drop `releases`/`urls`; the audit only needs info.version."""
+    if not isinstance(body, dict):
+        return body
+    info = body.get("info") if isinstance(body.get("info"), dict) else {}
+    releases = body.get("releases")
+    return {
+        "info": {
+            "name": info.get("name"),
+            "version": info.get("version"),
+            "requires_python": info.get("requires_python"),
+            "summary": _truncate(info.get("summary") or "", 300),
+        },
+        "release_count": len(releases) if isinstance(releases, dict) else None,
+    }
+
+
+def _slim_npm(body):
+    """Drop `versions`; the audit only needs the package identity."""
+    if not isinstance(body, dict):
+        return body
+    versions = body.get("versions")
+    return {
+        "name": body.get("name"),
+        "dist-tags": body.get("dist-tags"),
+        "description": _truncate(body.get("description") or "", 300),
+        "version_count": len(versions) if isinstance(versions, dict) else None,
+    }
+
+
+def _slim_osv(body):
+    """Keep every advisory id so the count stays exact, drop the prose."""
+    if not isinstance(body, dict):
+        return body
+    found = body.get("vulns")
+    if not isinstance(found, list):
+        return body
+    include_summary = len(found) <= VULN_SUMMARY_MAX
+    slim = []
+    for v in found[:MAX_VULNS]:
+        if not isinstance(v, dict):
+            continue
+        entry = {"id": v.get("id"), "aliases": (v.get("aliases") or [])[:2]}
+        if include_summary:
+            entry["summary"] = _truncate(v.get("summary") or "", 120)
+        slim.append(entry)
+    return {"vulns": slim, "vuln_count": len(found)}
+
+
+def _decode_b64(raw) -> Optional[str]:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return base64.b64decode(raw).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError, TypeError):
+        return None
+
+
+def _truncate_manifest_text(text: str, path: str = "", n: int = MAX_BODY_CHARS) -> tuple[str, bool]:
+    """Truncate manifest text so the result is still parseable.
+
+    Nothing is appended to the text: a trailing marker would make a TOML
+    document invalid and kill the parse outright. For pyproject.toml the cut is
+    taken at the last top-level table header, which keeps every included table
+    complete. Returns (text, was_truncated).
+    """
+    if len(text) <= n:
+        return text, False
+
+    head = text[:n]
+    if path.endswith(".toml"):
+        starts = [m.start() for m in re.finditer(r"(?m)^\[", head)]
+        if len(starts) > 1:
+            head = head[: starts[-1]]
+    else:
+        cut = head.rfind("\n")
+        if cut > n // 2:
+            head = head[:cut]
+    return head, True
 
 
 def _github_headers() -> dict:
@@ -71,32 +259,65 @@ def github_search_repos(query: str, sort: str = "updated", per_page: int = confi
         headers=_github_headers(),
         timeout=config.HTTP_TIMEOUT,
     )
-    return {"status_code": r.status_code, "body": _safe_json(r)}
+    return {"status_code": r.status_code, "body": _fit(_slim_github_search(_safe_json(r)))}
 
 
 @observe
 def github_get_file(repo_full_name: str, path: str):
-    """GET https://api.github.com/repos/{owner}/{repo}/contents/{path}"""
+    """GET https://api.github.com/repos/{owner}/{repo}/contents/{path}
+
+    GitHub returns file bodies base64-encoded, and a real manifest runs to
+    megabytes. Storing that verbatim is what bloated a session to 14.8 MB, so
+    the base64 is decoded here and only the manifest *text* is kept, truncated
+    on a line boundary. ``decode_manifest`` reads it back through
+    ``content_encoding``, so the dependency walk keeps working while the
+    observed event stays small.
+    """
     r = httpx.get(
         f"https://api.github.com/repos/{repo_full_name}/contents/{path}",
         headers=_github_headers(),
         timeout=config.HTTP_TIMEOUT,
     )
-    return {"status_code": r.status_code, "body": _safe_json(r)}
+    try:
+        body = r.json()
+    except Exception:
+        body = {"_raw_text": _truncate(r.text)}
+
+    if isinstance(body, dict) and "content" in body:
+        text = _decode_b64(body.get("content"))
+        if text is None:
+            body["content"] = "... [base64 omitted]"
+            body["content_encoding"] = "omitted"
+        else:
+            head, truncated = _truncate_manifest_text(text, path)
+            body["content"] = head
+            body["content_encoding"] = "utf-8"
+            if truncated:
+                body["content_truncated"] = True
+                body["content_original_chars"] = len(text)
+
+    return {"status_code": r.status_code, "body": _fit(_slim_github_file(body))}
 
 
 @observe
 def pypi_get_metadata(package: str):
-    """GET https://pypi.org/pypi/{package}/json"""
+    """GET https://pypi.org/pypi/{package}/json
+
+    The raw body carries every release ever published (hundreds of KB). Only
+    the latest version is read downstream, so that is all that is kept.
+    """
     r = httpx.get(f"https://pypi.org/pypi/{package}/json", timeout=config.HTTP_TIMEOUT)
-    return {"status_code": r.status_code, "body": _safe_json(r)}
+    return {"status_code": r.status_code, "body": _fit(_slim_pypi(_safe_json(r)))}
 
 
 @observe
 def npm_get_metadata(package: str):
-    """GET https://registry.npmjs.org/{package}"""
+    """GET https://registry.npmjs.org/{package}
+
+    The raw body carries every published version (often ~1 MB).
+    """
     r = httpx.get(f"https://registry.npmjs.org/{package}", timeout=config.HTTP_TIMEOUT)
-    return {"status_code": r.status_code, "body": _safe_json(r)}
+    return {"status_code": r.status_code, "body": _fit(_slim_npm(_safe_json(r)))}
 
 
 @observe
@@ -113,7 +334,7 @@ def osv_query(package: str, version: Optional[str], ecosystem: str = "PyPI"):
     if version:
         payload["version"] = version
     r = httpx.post("https://api.osv.dev/v1/query", json=payload, timeout=config.HTTP_TIMEOUT)
-    return {"status_code": r.status_code, "body": _safe_json(r)}
+    return {"status_code": r.status_code, "body": _fit(_slim_osv(_safe_json(r)))}
 
 
 # --------------------------------------------------------------------------
@@ -241,12 +462,27 @@ MANIFEST_PATHS = ("requirements.txt", "pyproject.toml")
 
 
 def decode_manifest(result: dict) -> Optional[str]:
-    """Decode the base64 `content` field of a GitHub contents response."""
+    """Return the manifest text from a GitHub contents response.
+
+    ``github_get_file`` decodes the base64 itself and marks the body with
+    ``content_encoding``, so the text path is checked first. A body that still
+    carries raw base64 (any other caller) keeps working unchanged.
+    """
     body = result.get("body")
     if not isinstance(body, dict):
         return None
     raw = body.get("content")
-    if not raw or body.get("encoding") not in (None, "base64"):
+    if not raw:
+        return None
+
+    marker = body.get("content_encoding")
+    if marker == "utf-8":
+        # Already decoded text, possibly truncated on a line boundary.
+        return raw
+    if marker == "omitted":
+        return None
+
+    if body.get("encoding") not in (None, "base64"):
         return None
     try:
         return base64.b64decode(raw).decode("utf-8", errors="replace")
@@ -267,6 +503,12 @@ _REQ_LINE = re.compile(
 )
 
 _PIN_OPS = ("==", "===")
+
+# A quoted PEP 508 requirement on its own line, as it appears inside a
+# `dependencies = [ ... ]` array. Only used to recover a truncated pyproject.toml.
+_QUOTED_SPEC_LINE = re.compile(
+    r"""^\s*["'](?P<spec>[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]*\])?\s*(?:[<>=!~][^"']*)?)["']\s*,?\s*$"""
+)
 
 
 def _clean_requirement_line(line: str) -> str:
@@ -314,8 +556,19 @@ def parse_pyproject_toml(text: str) -> list[dict]:
     try:
         data = tomllib.loads(text)
     except Exception as exc:
-        log.warning("pyproject.toml did not parse: %s", exc)
-        return []
+        # A body truncated mid-array is not valid TOML. Dependency entries are
+        # quoted one-per-line inside `dependencies = [...]`, so they can still
+        # be recovered rather than losing the whole manifest.
+        log.info("pyproject.toml did not parse (%s); scanning for quoted specs", exc)
+        specs = [
+            m.group("spec")
+            for m in (_QUOTED_SPEC_LINE.match(line) for line in text.splitlines())
+            if m
+        ]
+        if not specs:
+            log.warning("pyproject.toml yielded no parseable dependencies")
+            return []
+        return parse_requirements_txt("\n".join(specs))
 
     specs: list[str] = []
     project = data.get("project") or {}

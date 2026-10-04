@@ -53,11 +53,12 @@ PROVIDER_DEFAULTS = {
     "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
 }
 
-# Provider preference order when several keys are present.
+# Provider preference order when several keys are present. Groq comes first:
+# it is the provider whose key the deployment actually carries.
 _PROVIDER_KEYS = (
+    ("groq", "GROQ_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
-    ("groq", "GROQ_API_KEY"),
 )
 
 # Cycle behaviour
