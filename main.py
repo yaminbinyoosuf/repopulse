@@ -350,7 +350,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not config.settings.has_llm:
         log.error(
-            "no LLM API key found (DEEPSEEK_API_KEY / OPENAI_API_KEY / GROQ_API_KEY). "
+            "no LLM API key found (DEEPSEEK_API_KEY, "
+            "or OPENAI_API_KEY / GROQ_API_KEY as fallbacks). "
             "Refusing to run: there is no honest way to produce the summary, and a "
             "hardcoded one would invent a mismatch that never happened."
         )

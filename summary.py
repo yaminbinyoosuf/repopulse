@@ -44,7 +44,8 @@ def call_llm(system: str, user: str) -> str:
     """
     if not config.settings.has_llm:
         raise LLMUnavailable(
-            "no LLM API key configured (set GROQ_API_KEY, or DEEPSEEK_API_KEY / OPENAI_API_KEY)"
+            "no LLM API key configured (set DEEPSEEK_API_KEY, "
+            "or OPENAI_API_KEY / GROQ_API_KEY as fallbacks)"
         )
 
     url = f"{config.settings.llm_base_url}/chat/completions"

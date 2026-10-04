@@ -46,19 +46,21 @@ _ENV_ALLOWLIST = frozenset(
 
 # Default model per provider. These were checked against the live APIs rather
 # than assumed; in particular a Groq model name inherited from another project
-# was verified to return 404 model_not_found on this key.
+# was verified to return 404 model_not_found on that key.
 PROVIDER_DEFAULTS = {
-    "deepseek": ("https://api.deepseek.com", "deepseek-chat"),
+    "deepseek": ("https://api.deepseek.com/v1", "deepseek-chat"),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
     "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
 }
 
-# Provider preference order when several keys are present. Groq comes first:
-# it is the provider whose key the deployment actually carries.
+# Provider preference order when several keys are present. DeepSeek is the
+# active provider. Groq is kept last as a dead fallback: it is only reached if
+# neither DEEPSEEK_API_KEY nor OPENAI_API_KEY is set, so the code path survives
+# without being used.
 _PROVIDER_KEYS = (
-    ("groq", "GROQ_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
 )
 
 # Cycle behaviour
