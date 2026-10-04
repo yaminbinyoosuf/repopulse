@@ -216,14 +216,12 @@ _TOOL_ALIASES = {
 
 _COUNT_FAILURE = re.compile(
     r"\b(?:\d+|one|two|three|four|five|six|several|some|multiple|most|many)\b"
-    r"[^.]{0,80}?\b(?:fail|error|unavailable|missing|timed out|timeout|rate limit|"
-    r"not found|skipped|exceeded|unreachable)",
-    re.IGNORECASE,
-)
-_COUNT_FAILURE_REVERSED = re.compile(
-    r"\b(?:fail|error|unavailable|missing|timed out|timeout|rate limit|not found|"
-    r"skipped|exceeded|unreachable)\w*\b[^.]{0,80}?\b"
-    r"(?:\d+|one|two|three|four|five|six|several|some|multiple|most|many)\b",
+    r"(?:\s+of\s+(?:the\s+)?(?:\d+\s+)?)?\s*"
+    r"(?:lookups?|calls?|queries|requests?|checks?|dependencies|packages|"
+    r"repositories|repos|tools|operations|fetches|manifests?)"
+    r"[^.]{0,50}?"
+    r"\b(?:fail|failed|failing|error|errored|unavailable|missing|timed out|"
+    r"timeout|skipped|exceeded|unreachable)",
     re.IGNORECASE,
 )
 
@@ -233,29 +231,37 @@ def disclosure_of_failure(summary_text: str, mismatch: dict) -> Optional[str]:
 
     ``detect_mismatch`` fires on keyword overlap: if the summary contains any
     success-flavoured word it is treated as a success claim, even when the same
-    summary plainly reports the failure. A receipt produced that way would put
-    a false MISMATCH on the wall -- the agent never claimed success, so there is
-    nothing to catch. This returns the disclosing sentence so the cycle can
-    suppress that receipt and log exactly why.
+    summary plainly reports the failure. A receipt produced that way would put a
+    false MISMATCH on the wall -- the agent never claimed success, so there is
+    nothing to catch.
+
+    The test is deliberately narrow, and strictly about *this* failure:
+
+    1. a sentence naming the failing service/domain alongside a failure marker,
+       or
+    2. a sentence reporting an aggregate count of failed operations
+       ("3 of the 15 lookups failed").
+
+    Anything else leaves the claim standing. A disclosure about one service does
+    not excuse an undisclosed failure in another -- suppressing those would
+    throw away real catches.
     """
     tool = mismatch.get("tool") or ""
-    response = mismatch.get("tool_response") or {}
-    status = response.get("http_status")
     aliases = _TOOL_ALIASES.get(tool, (tool.replace("_", " "),))
 
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", summary_text) if s.strip()]
 
+    # 1. domain-specific disclosure
     for sentence in sentences:
         low = sentence.lower()
         if not any(marker in low for marker in FAILURE_MARKERS):
             continue
         if any(alias in low for alias in aliases):
             return sentence
-        if status is not None and str(status) in low:
-            return sentence
 
+    # 2. aggregate disclosure of failed operations
     for sentence in sentences:
-        if _COUNT_FAILURE.search(sentence) or _COUNT_FAILURE_REVERSED.search(sentence):
+        if _COUNT_FAILURE.search(sentence):
             return sentence
 
     return None

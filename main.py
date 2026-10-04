@@ -65,7 +65,9 @@ def run_cycle(dry_run: bool = False) -> dict:
         "notes": [],
         "summary": None,
         "mismatch": False,
-        "suppressed_disclosure": None,
+        "candidates": [],
+        "unpublished_reasons": [],
+        "suppressed_disclosures": [],
         "suppressions": 0,
         "receipts": [],
         "session_published": False,
@@ -131,33 +133,101 @@ def run_cycle(dry_run: bool = False) -> dict:
     log.info("agent summary: %s", summary_text.replace("\n", " ")[:400])
 
     # --- cogext-observe compares the claim against the real calls ----------
+    # detect_mismatch only ever inspects recent_calls[0]. Running the same real
+    # detector across the window is what the brief's own safeguards assume:
+    # de-duplication, a cap of three catches and severity ordering mean nothing
+    # when there is only ever one candidate, and it is the only way a real
+    # overclaim about an earlier failure can be caught at all. The detector
+    # itself is untouched -- it is simply applied to each failed call.
     recent = get_recent_calls()
-    mismatch = detect_mismatch(summary_text, recent)
-    report["mismatch"] = bool(mismatch)
-    log.info("cogext-observe detect_mismatch -> %s", "MISMATCH" if mismatch else "consistent")
+    failed_calls = [c for c in recent if c.get("failure")]
 
-    if not mismatch:
+    candidates = []
+    for index, call in enumerate(recent):
+        if not call.get("failure"):
+            continue
+        mismatch = detect_mismatch(summary_text, recent[index:])
+        if not mismatch:
+            continue
+        candidates.append(
+            {
+                "tool": mismatch["tool"],
+                "http_status": (mismatch.get("tool_response") or {}).get("http_status"),
+                "tier": publish.tier_for(mismatch),
+                "mismatch": mismatch,
+            }
+        )
+
+    report["mismatch"] = bool(candidates)
+    report["candidates"] = [
+        {"tool": c["tool"], "http_status": c["http_status"], "tier": c["tier"]}
+        for c in candidates
+    ]
+    log.info(
+        "cogext-observe: %d failed call(s) in the window -> %d candidate mismatch(es)",
+        len(failed_calls),
+        len(candidates),
+    )
+
+    if not candidates:
         report["outcome"] = "no mismatch: the summary matches the observed tool results"
         return report
 
-    # The observer's detector fires on keyword overlap. If the agent in fact
-    # disclosed the failure, there is no claim to catch, and publishing it
-    # would put a false MISMATCH on the wall.
-    disclosure = agent.disclosure_of_failure(summary_text, mismatch)
-    if disclosure:
-        report["suppressed_disclosure"] = disclosure
-        report["suppressions"] = 1
-        report["outcome"] = "mismatch suppressed: the summary discloses the failure itself"
-        log.warning("%s | disclosing sentence: %s", report["outcome"], disclosure)
+    # Wall hygiene. Drop 404s, and drop the detector's false positives: if the
+    # agent disclosed the failure itself then it never claimed success, and
+    # publishing that would be a MISMATCH receipt for a claim nobody made.
+    publishable = []
+    for cand in candidates:
+        if cand["tier"] is None:
+            report["unpublished_reasons"].append(
+                f"{cand['tool']}:{cand['http_status']} skipped -- 404 is an ordinary answer"
+            )
+            continue
+        disclosure = agent.disclosure_of_failure(summary_text, cand["mismatch"])
+        if disclosure:
+            report["suppressions"] += 1
+            report["suppressed_disclosures"].append(
+                {
+                    "tool": cand["tool"],
+                    "http_status": cand["http_status"],
+                    "disclosure": disclosure,
+                }
+            )
+            report["unpublished_reasons"].append(
+                f"{cand['tool']}:{cand['http_status']} suppressed -- the summary discloses the failure"
+            )
+            log.warning(
+                "suppressed %s:%s -- the summary discloses the failure: %s",
+                cand["tool"],
+                cand["http_status"],
+                disclosure,
+            )
+            continue
+        publishable.append(cand)
+
+    if not publishable:
+        report["outcome"] = (
+            "no publishable catch: every candidate was a 404 or was disclosed by the summary"
+        )
         return report
 
-    receipt = generate_receipt(mismatch, session_id)
-    signature_ok = verify_receipt(receipt)
-    report["receipts"].append(
-        {
+    # 5xx first, then auth/rate limit, then timeouts.
+    publishable.sort(key=lambda c: c["tier"])
+    selected = publishable[: config.MAX_CATCHES_PER_CYCLE]
+    if len(publishable) > len(selected):
+        report["unpublished_reasons"].append(
+            f"{len(publishable) - len(selected)} catch(es) dropped by the "
+            f"{config.MAX_CATCHES_PER_CYCLE}-per-cycle cap"
+        )
+
+    for cand in selected:
+        receipt = generate_receipt(cand["mismatch"], session_id)
+        signature_ok = verify_receipt(receipt)
+        entry = {
             "receipt_id": receipt["receipt_id"],
             "tool": receipt["tool"],
             "http_status": (receipt.get("tool_response") or {}).get("http_status"),
+            "tier": cand["tier"],
             "agent_claim": receipt["agent_claim"],
             "verify_url": receipt["verify_url"],
             "signature_valid": signature_ok,
@@ -165,40 +235,53 @@ def run_cycle(dry_run: bool = False) -> dict:
             "browser_valid": False,
             "published": False,
         }
-    )
-    log.info(
-        "mismatch: tool=%s status=%s signature=%s",
-        receipt["tool"],
-        (receipt.get("tool_response") or {}).get("http_status"),
-        "valid" if signature_ok else "INVALID",
-    )
-
-    if dry_run:
-        report["outcome"] = "dry run: receipt generated and signed but not published"
-        return report
-
-    if not publish.publish(receipt):
-        report["outcome"] = "receipt was not accepted by the backend"
-        return report
-
-    entry = report["receipts"][-1]
-    entry["published"] = True
-    check = publish.verify_receipt_on_wall(receipt["receipt_id"])
-    entry["stored"] = check["stored"]
-    entry["browser_valid"] = check["browser_valid"]
-    if check.get("note"):
-        entry["verify_note"] = check["note"]
-    if not check["browser_valid"]:
-        log.error(
-            "receipt %s is stored but would NOT verify in the browser (%s)",
-            receipt["receipt_id"],
-            check.get("note") or "signature mismatch",
+        report["receipts"].append(entry)
+        log.info(
+            "candidate catch tier %s: tool=%s status=%s signature=%s",
+            cand["tier"],
+            receipt["tool"],
+            entry["http_status"],
+            "valid" if signature_ok else "INVALID",
         )
 
+        if dry_run:
+            continue
+
+        if not publish.publish(receipt):
+            report["unpublished_reasons"].append(
+                f"{entry['tool']}:{entry['http_status']} not accepted by the backend"
+            )
+            continue
+
+        entry["published"] = True
+        check = publish.verify_receipt_on_wall(receipt["receipt_id"])
+        entry["stored"] = check["stored"]
+        entry["browser_valid"] = check["browser_valid"]
+        if check.get("note"):
+            entry["verify_note"] = check["note"]
+        if not check["browser_valid"]:
+            log.error(
+                "receipt %s is stored but would NOT verify in the browser (%s)",
+                receipt["receipt_id"],
+                check.get("note") or "signature mismatch",
+            )
+
+    published = [r for r in report["receipts"] if r["published"]]
+
+    if dry_run:
+        report["outcome"] = (
+            f"dry run: {len(report['receipts'])} receipt(s) generated and signed, nothing published"
+        )
+        return report
+
+    if not published:
+        report["outcome"] = "no receipt was accepted by the backend"
+        return report
+
     # A session only reaches the Square once published, and only a cycle that
-    # produced a real receipt has anything to show there.
+    # published a real receipt has anything to show there.
     report["session_published"] = publish.publish_session(session_id)
-    report["outcome"] = "published 1 real catch"
+    report["outcome"] = f"published {len(published)} real catch(es)"
     return report
 
 
@@ -217,17 +300,20 @@ def print_report(report: dict) -> None:
             print(f"  - {note}")
     if report.get("summary"):
         print(f"agent summary   :\n  {report['summary']}")
+    print(f"candidates      : {report.get('candidates') or 'none'}")
     print(f"mismatch        : {report['mismatch']}")
     print(f"suppressions    : {report.get('suppressions', 0)}")
-    if report.get("suppressed_disclosure"):
-        print(f"suppressed      : {report['suppressed_disclosure']}")
+    for s in report.get("suppressed_disclosures", []):
+        print(f"  suppressed {s['tool']}:{s['http_status']} -- {s['disclosure']}")
+    for reason in report.get("unpublished_reasons", []):
+        print(f"  not published: {reason}")
     print(f"outcome         : {report['outcome']}")
     if report["receipts"]:
         print("receipts        :")
         for r in report["receipts"]:
             print(
                 f"  {r['verify_url']}\n"
-                f"    tool={r['tool']} http_status={r['http_status']} "
+                f"    tool={r['tool']} http_status={r['http_status']} tier={r.get('tier')} "
                 f"signature={'valid' if r['signature_valid'] else 'INVALID'} "
                 f"stored={r['stored']} browser={'VALID' if r.get('browser_valid') else 'INVALID'} "
                 f"published={r['published']}"
