@@ -1,0 +1,49 @@
+name: RepoPulse Witness
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# One cycle at a time. Overlapping runs would audit the same ecosystem twice
+# and could put duplicate catches on the wall.
+concurrency:
+  group: repopulse-witness
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one cycle
+        env:
+          # Secret GH_TOKEN is exposed to the code as GITHUB_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          # Any one of these enables the summary. The code picks the first
+          # provider whose key is present and non-empty.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Optional: override the per-provider default model.
+          REPOPULSE_LLM_MODEL: ${{ vars.REPOPULSE_LLM_MODEL }}
+          COGEXT_API_URL: https://api.cogextai.com/api/v1
+        run: python main.py --once
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repopulse-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
