@@ -247,7 +247,20 @@ def disclosure_of_failure(summary_text: str, mismatch: dict) -> Optional[str]:
     throw away real catches.
     """
     tool = mismatch.get("tool") or ""
-    aliases = _TOOL_ALIASES.get(tool, (tool.replace("_", " "),))
+    # Accept the tool's own name in every form a report actually uses it:
+    # github_open_issues, "github open issues", "github-open-issues". Without
+    # this, a disclosure that names the tool literally is not recognised, and a
+    # false MISMATCH receipt is published for a failure the agent did report.
+    aliases = set(_TOOL_ALIASES.get(tool, ()))
+    aliases.update(
+        {
+            tool,
+            tool.replace("_", " "),
+            tool.replace("_", "-"),
+            tool.replace("_", ""),
+        }
+    )
+    aliases = tuple(a.lower() for a in aliases if a)
 
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", summary_text) if s.strip()]
 

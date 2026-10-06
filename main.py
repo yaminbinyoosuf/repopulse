@@ -27,7 +27,7 @@ import summary
 import tools
 from cogext_observe.decorator import get_recent_calls
 from cogext_observe.detector import detect_mismatch
-from cogext_observe.receipt import generate_receipt, verify_receipt
+from cogext_observe.receipt import verify_receipt
 
 log = logging.getLogger("repopulse")
 
@@ -221,7 +221,7 @@ def run_cycle(dry_run: bool = False) -> dict:
         )
 
     for cand in selected:
-        receipt = generate_receipt(cand["mismatch"], session_id)
+        receipt = publish.sign_receipt(cand["mismatch"], session_id)
         signature_ok = verify_receipt(receipt)
         entry = {
             "receipt_id": receipt["receipt_id"],

@@ -19,13 +19,17 @@ three catches per cycle, severity ordering, and 404s skipped entirely.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import config
 import httpx
+from cogext_observe.receipt import DEFAULT_KEY, canonical_json, generate_receipt
 
 log = logging.getLogger("repopulse.publish")
 
@@ -172,6 +176,30 @@ def publish(receipt: dict) -> bool:
         (receipt.get("tool_response") or {}).get("http_status"),
     )
     return True
+
+
+def sign_receipt(mismatch: dict, session_id: str) -> dict:
+    """Sign a receipt with a timestamp that survives storage.
+
+    Postgres trims trailing zeros from fractional seconds, so a recorded_at of
+    ``...26.176400+00:00`` is stored and served back as ``...26.1764+00:00``.
+    That silently changes a signed field: the browser re-serialises what it
+    fetched, computes a different HMAC, and shows INVALID. In practice roughly
+    one receipt in ten failed to verify.
+
+    Signing with whole seconds removes the fractional part entirely, so there is
+    nothing for storage to normalise.
+    """
+    seed = generate_receipt(mismatch, session_id)
+    payload = {k: seed[k] for k in SIGNED_FIELDS}
+    payload["recorded_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    signing_key = os.environ.get("COGEXT_RECEIPT_KEY", DEFAULT_KEY)
+    payload["signature"] = hmac.new(
+        signing_key.encode(), canonical_json(payload).encode(), hashlib.sha256
+    ).hexdigest()
+    payload["verify_url"] = f"https://cogextai.com/r/{payload['receipt_id']}"
+    return payload
 
 
 def verify_receipt_stored(receipt_id: str) -> bool:

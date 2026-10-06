@@ -1,0 +1,42 @@
+name: Ops Witness
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+# One cycle at a time. Overlapping runs would deliver the same digest twice.
+concurrency:
+  group: ops-witness
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one cycle
+        env:
+          # Needs issues:write on the delivery repo.
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          COGEXT_API_URL: https://api.cogextai.com/api/v1
+        run: python ops_main.py --once
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-witness-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
