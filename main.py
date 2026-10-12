@@ -28,6 +28,7 @@ import tools
 from cogext_observe.decorator import get_recent_calls
 from cogext_observe.detector import detect_mismatch
 from cogext_observe.receipt import verify_receipt
+from cogext_observe.session import set_session_token
 
 log = logging.getLogger("repopulse")
 
@@ -89,11 +90,16 @@ def run_cycle(dry_run: bool = False) -> dict:
 
     # Label first, then create: events and receipts must share one session.
     agent.bind_observer_session(session_id)
+    session_token: Optional[str] = None
     if dry_run:
         log.info("dry run: not creating the session on the backend")
-    elif not publish.create_session(session_id):
-        report["outcome"] = "could not create session on the backend; nothing published"
-        return report
+    else:
+        session_token = publish.create_session(session_id)
+        if not session_token:
+            report["outcome"] = "could not create session on the backend; nothing published"
+            return report
+        # cogext-observe streams the tool events itself; it needs the token too.
+        set_session_token(session_id, session_token)
 
     findings, notes, blocked = agent.collect_findings()
     report["notes"] = notes
@@ -280,7 +286,7 @@ def run_cycle(dry_run: bool = False) -> dict:
 
     # A session only reaches the Square once published, and only a cycle that
     # published a real receipt has anything to show there.
-    report["session_published"] = publish.publish_session(session_id)
+    report["session_published"] = publish.publish_session(session_id, session_token)
     report["outcome"] = f"published {len(published)} real catch(es)"
     return report
 

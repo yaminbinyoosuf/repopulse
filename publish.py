@@ -74,18 +74,27 @@ def _post(path: str, payload: dict, timeout: float = 10.0) -> tuple[int, Any]:
         return r.status_code, {"_raw_text": r.text[:300]}
 
 
-def create_session(session_id: str) -> bool:
-    """Idempotent. The observer calls this before its first tool."""
+def create_session(session_id: str) -> Optional[str]:
+    """Create the session before the first tool runs; return its publish token.
+
+    The backend issues the token once, at creation, and requires it on every
+    /live/event and /live/publish write for this session. Returns None on any
+    failure, including 409 (the id already exists and is not ours).
+    """
     status, body = _post("/live/session", {"session_id": session_id}, timeout=10.0)
-    ok = status == 200
-    if not ok:
+    token = body.get("publish_token") if status == 200 and isinstance(body, dict) else None
+    if not token:
         log.warning("session create for %s -> HTTP %s %s", session_id, status, str(body)[:200])
-    return ok
+    return token
 
 
-def publish_session(session_id: str) -> bool:
+def publish_session(session_id: str, publish_token: str) -> bool:
     """Make a session visible on the Square. This is the wall write."""
-    status, body = _post("/live/publish", {"session_id": session_id}, timeout=10.0)
+    status, body = _post(
+        "/live/publish",
+        {"session_id": session_id, "publish_token": publish_token},
+        timeout=10.0,
+    )
     ok = status == 200
     if ok:
         log.info("published session %s to the Square", session_id)

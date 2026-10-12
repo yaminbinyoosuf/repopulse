@@ -36,6 +36,7 @@ import tools
 from cogext_observe.decorator import get_recent_calls
 from cogext_observe.detector import detect_mismatch
 from cogext_observe.receipt import verify_receipt
+from cogext_observe.session import set_session_token
 
 log = logging.getLogger("repopulse.ops")
 
@@ -277,11 +278,16 @@ def run_cycle(dry_run: bool = False) -> dict:
     log.info("ops cycle start | session %s | dry_run=%s", session_id, dry_run)
 
     agent.bind_observer_session(session_id)
+    session_token: Optional[str] = None
     if dry_run:
         log.info("dry run: not creating the session on the backend")
-    elif not publish.create_session(session_id):
-        report["outcome"] = "could not create session on the backend; nothing published"
-        return report
+    else:
+        session_token = publish.create_session(session_id)
+        if not session_token:
+            report["outcome"] = "could not create session on the backend; nothing published"
+            return report
+        # cogext-observe streams the tool events itself; it needs the token too.
+        set_session_token(session_id, session_token)
 
     records, notes, blocked = gather()
     report["notes"] = notes
@@ -437,7 +443,7 @@ def run_cycle(dry_run: bool = False) -> dict:
         report["outcome"] = "no receipt was accepted by the backend"
         return report
 
-    report["session_published"] = publish.publish_session(session_id)
+    report["session_published"] = publish.publish_session(session_id, session_token)
     report["outcome"] = f"published {len(published)} real catch(es)"
     return report
 
